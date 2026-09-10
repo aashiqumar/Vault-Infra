@@ -1,0 +1,43 @@
+name: Deploy Vault Infra
+
+on:
+  repository_dispatch:
+    types: [ui-deployed]
+  push:
+    branches:
+      - main
+      - develop
+
+jobs:
+  deploy_infra:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: ${{ (github.event_name == 'repository_dispatch' && github.event.client_payload.environment) || (github.ref_name == 'main' && 'production' || 'uat') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Functions dependencies
+        run: npm --prefix functions install
+
+      - name: Inject Functions environment secrets
+        run: |
+          echo "RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}" >> functions/.env
+          echo "RESEND_FROM_EMAIL=${{ secrets.RESEND_FROM_EMAIL }}" >> functions/.env
+
+      - name: Deploy functions, Firestore rules & indexes, Storage rules
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          npx firebase-tools deploy \
+            --only functions,firestore,storage \
+            --project ${{ secrets.FIREBASE_PROJECT_ID }} \
+            --non-interactive \
+            --force

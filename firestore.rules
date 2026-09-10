@@ -1,0 +1,554 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // HELPER: Get the user profile data safely
+    function getUserData() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data
+        : {};
+    }
+
+    // HELPER: Derive memberType — mirrors deriveMemberType() in permissions.ts.
+    // Boolean flags (isExcoMember, isBoardMember) are admin-authoritative and
+    // take precedence over the cached memberType field, which can lag when a
+    // board-designation toggle and the memberType migration run in different
+    // sessions. Order must stay in sync with the TypeScript function.
+    function getMemberType(data) {
+      return ('isExcoMember' in data && data.isExcoMember == true) ? 'EXCO'
+        : ('isBoardMember' in data && data.isBoardMember == true) ? 'BOARD'
+        : ('memberType' in data && data.memberType != null) ? data.memberType
+        : ('verified' in data && data.verified == true) ? 'GENERAL'
+        : 'PROSPECTIVE';
+    }
+
+    // HELPER: Check if user belongs to a specific club
+    function isUserInClub(clubId) {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.clubId == clubId &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.verified == true;
+    }
+
+    // HELPER: Check if the user is an Admin of their club
+    function isAdmin(clubId) {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.clubId == clubId && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN' &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.verified == true;
+    }
+
+    // HELPER: Check if the user is authorized to manage payments (Admin, Exco, or has manage_payments permission)
+    function canManagePayments(clubId) {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.clubId == clubId && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.verified == true &&
+             (
+               get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN' ||
+               ('isExcoMember' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data && 
+                get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isExcoMember == true) ||
+               ('permissions' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data && 
+                get(/databases/$(database)/documents/users/$(request.auth.uid)).data.permissions.hasAny(['manage_payments']))
+             );
+    }
+
+    // HELPER: Check if this club is still in bootstrap (no admin lock yet)
+    function isBootstrap(clubId) {
+      return !exists(/databases/$(database)/documents/admin_locks/$(clubId));
+    }
+
+    // HELPER: A non-privileged signup payload (self-registration path).
+    // Grants only when the doc is created as an unverified VIEWER (or verified omitted).
+    function isSignupPayload() {
+      return request.resource.data.role == 'VIEWER'
+        && (
+          !('verified' in request.resource.data) ||
+          request.resource.data.verified == false
+        );
+    }
+
+    // HELPER: Self-edit limited to non-privilege keys, with memberType pinned to
+    // the value derived from the existing flags (permits the lazy migration
+    // write-back but blocks self-promotion).
+    function isSafeSelfEdit() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['displayName', 'fcmTokens', 'memberType', 'hasOnboarded'])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['memberType']) ||
+          request.resource.data.memberType == getMemberType(resource.data)
+        );
+    }
+
+    function isCurrentYear(clubId, rotaractYear) {
+      return rotaractYear == null || 
+             !exists(/databases/$(database)/documents/settings/$(clubId)) ||
+             !("currentRotaractYear" in get(/databases/$(database)/documents/settings/$(clubId)).data) ||
+             get(/databases/$(database)/documents/settings/$(clubId)).data.currentRotaractYear == null ||
+             get(/databases/$(database)/documents/settings/$(clubId)).data.currentRotaractYear == rotaractYear;
+    }
+
+    // HELPER: Check if a resource belongs to the current active year
+    function isResourceCurrentYear(clubId, resourceId) {
+      return !exists(/databases/$(database)/documents/resources/$(resourceId)) ||
+             !("rotaractYear" in get(/databases/$(database)/documents/resources/$(resourceId)).data) ||
+             isCurrentYear(clubId, get(/databases/$(database)/documents/resources/$(resourceId)).data.rotaractYear);
+    }
+
+    // 1. CLUBS & TENANCY
+    match /clubs/{slug} {
+      allow read: if true; 
+      allow write: if true; // SuperAdmin local/UAT onboarding
+    }
+
+    match /admin_locks/{clubId} {
+      allow read: if true; 
+      allow write: if true; // SuperAdmin local/UAT onboarding
+    }
+
+    // 2. EVENTS
+    match /events/{eventId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId && (
+          isAdmin(request.resource.data.clubId) ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+        );
+      // Use resource.data.clubId (existing doc) for partial updates (RSVP, attendance)
+      // not request.resource.data.clubId which fails on partial field updates.
+      // Tier 1 security: non-managers may ONLY update their own attendanceMap or
+      // rsvp entry — no other fields, and never another member's entry.
+      allow update: if request.auth != null &&
+        isUserInClub(resource.data.clubId) &&
+        isCurrentYear(resource.data.clubId, resource.data.rotaractYear) &&
+        (
+          // Event managers keep full update rights
+          isAdmin(resource.data.clubId) ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members'])) ||
+          ('isBoardMember' in getUserData() && getUserData().isBoardMember == true) ||
+          ('isExcoMember' in getUserData() && getUserData().isExcoMember == true) ||
+          // Self check-in: member may only touch their own attendanceMap entry
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['attendanceMap']) &&
+            (
+              (!('attendanceMap' in resource.data) &&
+                request.resource.data.attendanceMap.keys().hasOnly([request.auth.uid])) ||
+              ('attendanceMap' in resource.data &&
+                resource.data.attendanceMap.diff(request.resource.data.attendanceMap)
+                  .affectedKeys().hasOnly([request.auth.uid]))
+            )
+          ) ||
+          // Self RSVP: member may only touch their own rsvp entry
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rsvps']) &&
+            (
+              (!('rsvps' in resource.data) &&
+                request.resource.data.rsvps.keys().hasOnly([request.auth.uid])) ||
+              ('rsvps' in resource.data &&
+                resource.data.rsvps.diff(request.resource.data.rsvps)
+                  .affectedKeys().hasOnly([request.auth.uid]))
+            )
+          )
+        );
+      allow delete: if request.auth != null && (
+        isAdmin(resource.data.clubId) ||
+        ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+      ) && isCurrentYear(resource.data.clubId, resource.data.rotaractYear);
+    }
+
+    // 2a. EVENT ANNOUNCEMENTS (subcollection under events)
+    match /events/{eventId}/announcements/{annId} {
+      // Any verified club member can read announcements for their club's events
+      allow read: if request.auth != null &&
+        exists(/databases/$(database)/documents/events/$(eventId)) &&
+        isUserInClub(get(/databases/$(database)/documents/events/$(eventId)).data.clubId);
+      // Only admins / board members can post or delete announcements
+      allow create: if request.auth != null &&
+        exists(/databases/$(database)/documents/events/$(eventId)) &&
+        (
+          isAdmin(get(/databases/$(database)/documents/events/$(eventId)).data.clubId) ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members'])) ||
+          ('isBoardMember' in getUserData() && getUserData().isBoardMember == true)
+        );
+      allow delete: if request.auth != null &&
+        exists(/databases/$(database)/documents/events/$(eventId)) &&
+        (
+          isAdmin(get(/databases/$(database)/documents/events/$(eventId)).data.clubId) ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members'])) ||
+          ('isBoardMember' in getUserData() && getUserData().isBoardMember == true)
+        );
+    }
+
+    // 8. RESOURCES
+    match /resources/{resourceId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId && (
+          isAdmin(request.resource.data.clubId) ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members'])) ||
+          (isUserInClub(request.resource.data.clubId) &&
+           request.resource.data.category in ['Proposals', 'Reports'])
+        );
+      allow update: if request.auth != null &&
+        request.resource.data.clubId == resource.data.clubId && (
+          isAdmin(resource.data.clubId) ||
+          request.auth.uid == resource.data.uploadedBy ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+        ) && isCurrentYear(resource.data.clubId, resource.data.rotaractYear);
+      allow delete: if request.auth != null && (
+        isAdmin(resource.data.clubId) ||
+        request.auth.uid == resource.data.uploadedBy ||
+        ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+      ) && isCurrentYear(resource.data.clubId, resource.data.rotaractYear);
+    }
+
+    // 8b. RESOURCE DETAILS
+    match /resourceDetails/{resourceId} {
+      allow read: if request.auth != null && (resource == null || isUserInClub(resource.data.clubId));
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId && (
+          isAdmin(request.resource.data.clubId) ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members'])) ||
+          (isUserInClub(request.resource.data.clubId) &&
+           request.resource.data.category in ['Proposals', 'Reports'])
+        );
+      allow update: if request.auth != null && 
+        request.resource.data.clubId == resource.data.clubId && (
+          isAdmin(resource.data.clubId) || 
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+        ) && isResourceCurrentYear(resource.data.clubId, resourceId);
+      allow delete: if request.auth != null && (
+        isAdmin(resource.data.clubId) ||
+        ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+      ) && isResourceCurrentYear(resource.data.clubId, resourceId);
+    }
+
+    // 8c. PROJECT ARTICLES — chair-authored, publishable showcase content.
+    // Published articles are readable without auth (club login page / public
+    // showcase); drafts are visible only to their author or a club admin.
+    match /articles/{articleId} {
+      allow read: if resource.data.status == 'PUBLISHED' ||
+        (request.auth != null && isUserInClub(resource.data.clubId) &&
+          (isAdmin(resource.data.clubId) || request.auth.uid == resource.data.authorUid));
+      allow create: if request.auth != null &&
+        isUserInClub(request.resource.data.clubId) &&
+        request.resource.data.authorUid == request.auth.uid &&
+        request.resource.data.status != 'PUBLISHED';
+      // Only an admin or the author (non-published) may write via client SDK.
+      // Approval resolution (PUBLISHED status) is set by the onApprovalResolved
+      // Cloud Function using the Admin SDK, which bypasses these rules entirely.
+      allow update: if request.auth != null &&
+        request.resource.data.clubId == resource.data.clubId &&
+        isUserInClub(resource.data.clubId) &&
+        (
+          isAdmin(resource.data.clubId) ||
+          (request.auth.uid == resource.data.authorUid && request.resource.data.status != 'PUBLISHED')
+        );
+      // Admins can delete any article; authors can delete their own (incl. published,
+      // so they can retract if needed — admin approval is the publish gate, not delete).
+      allow delete: if request.auth != null && isUserInClub(resource.data.clubId) &&
+        (isAdmin(resource.data.clubId) || request.auth.uid == resource.data.authorUid);
+    }
+
+    // 9. TASKS
+    match /tasks/{taskId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow create: if request.auth != null && 
+        request.resource.data.clubId == getUserData().clubId;
+      allow update: if request.auth != null && 
+        request.resource.data.clubId == resource.data.clubId;
+      allow delete: if request.auth != null && (
+        isAdmin(resource.data.clubId) || 
+        ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings', 'manage_members']))
+      );
+    }
+
+    // 3. ACCESS REQUESTS
+    match /accessRequests/{requestId} {
+      allow create: if request.auth != null && 
+        request.resource.data.clubId != null &&
+        request.resource.data.status == 'PENDING';
+      allow read, delete: if request.auth != null && 
+        isAdmin(resource.data.clubId);
+    }
+
+    // 4. USER PROFILES
+    match /users/{userId} {
+      allow read: if request.auth != null && (
+        request.auth.uid == userId || 
+        (resource != null && isUserInClub(resource.data.clubId))
+      );
+      
+      // create: self-create only with non-privileged payload, or the bootstrap admin path, or admin
+      allow create: if request.auth != null &&
+        request.auth.uid == userId && (
+          isSignupPayload() ||
+          isBootstrap(request.resource.data.clubId) ||
+          isAdmin(request.resource.data.clubId)
+        );
+      
+      // update: club admin, OR same-club manage_members holder editing OTHERS
+      // (never their own privileges, never role/isDeveloper), OR self restricted
+      // to safe keys.
+      allow update: if request.auth != null &&
+        request.resource.data.clubId == resource.data.clubId && (
+          isAdmin(resource.data.clubId) ||
+          (
+            request.auth.uid != userId &&
+            isUserInClub(resource.data.clubId) &&
+            'permissions' in getUserData() &&
+            getUserData().permissions.hasAny(['manage_members']) &&
+            !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['role', 'isDeveloper', 'clubId'])
+          ) ||
+          (request.auth.uid == userId && isSafeSelfEdit())
+        );
+      
+      allow delete: if request.auth != null && 
+        isAdmin(resource.data.clubId);
+    }
+    
+    // 5. MEMBERS
+    match /members/{docId} {
+      // resource == null handles transaction reads on non-existent sentinel docs (e.g. members/system)
+      allow read: if request.auth != null && (resource == null || isUserInClub(resource.data.clubId));
+      allow create: if true; // Allow anonymous creation for SuperAdmin onboarding
+      // Full update: club admin or manage_members permission holder (e.g. registry editors)
+      // This also covers writing auditHistory, lastUpdatedBy, lastUpdatedAt, isBoardMember, isExcoMember
+      // which are written by the Profile & Record Management workspace.
+      allow update: if request.auth != null && (
+        // Onboarding/SuperAdmin path (no verified user yet)
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        isAdmin(resource.data.clubId) ||
+        (
+          isUserInClub(resource.data.clubId) &&
+          'permissions' in getUserData() &&
+          getUserData().permissions.hasAny(['manage_members'])
+        ) ||
+        // Board members and EXCO can update (needed for Settings toggle sync)
+        (
+          isUserInClub(resource.data.clubId) && (
+            ('isBoardMember' in getUserData() && getUserData().isBoardMember == true) ||
+            ('isExcoMember' in getUserData() && getUserData().isExcoMember == true)
+          )
+        )
+      );
+      allow delete: if request.auth != null &&
+        isAdmin(resource.data.clubId);
+    }
+    
+    // 6. PAYMENTS
+    match /payments/{docId} {
+      // Admins and managers can read all payments in their club.
+      // Regular members can only read their own payment records.
+      allow read: if request.auth != null && (
+        canManagePayments(resource.data.clubId) ||
+        (
+          isUserInClub(resource.data.clubId) &&
+          (
+            resource.data.memberId == request.auth.uid ||
+            resource.data.submittedBy == request.auth.uid ||
+            (
+              exists(/databases/$(database)/documents/members/$(resource.data.memberId)) &&
+              get(/databases/$(database)/documents/members/$(resource.data.memberId)).data.email == getUserData().email
+            )
+          )
+        )
+      );
+      // Any verified club member can submit a PENDING payment (Maker workflow).
+      // Admins/exco/manage_payments can create with any status.
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId &&
+        isUserInClub(request.resource.data.clubId) &&
+        (request.resource.data.status == 'PENDING' || canManagePayments(request.resource.data.clubId));
+      // Admins, exco members, or users with manage_payments can approve/reject
+      allow update: if request.auth != null &&
+        canManagePayments(resource.data.clubId) &&
+        request.resource.data.clubId == resource.data.clubId &&
+        isCurrentYear(resource.data.clubId, resource.data.rotaractYear);
+      // Allow approving/rejecting PENDING payments from any year (e.g. after a year
+      // transition, pending cross-year payments must still be actionable). Constrained
+      // to only the verification fields so no other data can be changed this way.
+      allow update: if request.auth != null &&
+        canManagePayments(resource.data.clubId) &&
+        resource.data.clubId == request.resource.data.clubId &&
+        resource.data.status == 'PENDING' &&
+        request.resource.data.status in ['APPROVED', 'REJECTED'] &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'approvedBy', 'approvedByName', 'approvedAt', 'rejectionReason', 'cashBatchId']);
+      allow delete: if request.auth != null &&
+        isAdmin(resource.data.clubId) &&
+        isCurrentYear(resource.data.clubId, resource.data.rotaractYear);
+    }
+
+    // 6a. CASH BATCHES
+    match /cashBatches/{batchId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId &&
+        canManagePayments(request.resource.data.clubId) &&
+        isCurrentYear(request.resource.data.clubId, request.resource.data.rotaractYear);
+      // Only verification status fields may be updated; all other fields and deletes are immutable
+      allow update: if request.auth != null &&
+        canManagePayments(resource.data.clubId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'verifiedBy', 'verifiedByName', 'verifiedAt']);
+      allow delete: if false;
+    }
+
+    // 7. SETTINGS
+    match /settings/{clubId} {
+      allow read: if request.auth != null && isUserInClub(clubId);
+      // Allow creation for onboarding
+      allow create: if true;
+      // Full update: admins only
+      allow update: if request.auth != null && (
+        isAdmin(clubId) ||
+        (canManagePayments(clubId) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['treasuryStats']))
+      );
+      allow delete: if request.auth != null && isAdmin(clubId);
+    }
+
+    // 10. NOTIFICATIONS
+    match /notifications/{notificationId} {
+      // Users can only read their own notifications AND must belong to and be verified in the same club/tenant
+      allow read: if request.auth != null && 
+                    resource.data.toUid == request.auth.uid && 
+                    isUserInClub(resource.data.clubId);
+      // Users can mark their own notifications as read
+      allow update: if request.auth != null && 
+                       resource.data.toUid == request.auth.uid && 
+                       isUserInClub(resource.data.clubId) &&
+                       request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow create, delete: if false;
+    }
+
+    // 11. FEEDBACK & ISSUES
+    match /feedback/{ticketId} {
+      allow read: if request.auth != null && (
+        getUserData().isDeveloper == true ||
+        (resource.data.clubId == getUserData().clubId && resource.data.submittedBy == request.auth.uid)
+      );
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId &&
+        request.resource.data.submittedBy == request.auth.uid &&
+        request.resource.data.status == 'PENDING';
+      allow update, delete: if request.auth != null && getUserData().isDeveloper == true;
+    }
+
+    // 12. RELEASES
+    match /releases/{releaseId} {
+      allow read: if request.auth != null && (
+        getUserData().isDeveloper == true ||
+        isUserInClub(resource.data.clubId)
+      );
+      allow create, update, delete: if request.auth != null && getUserData().isDeveloper == true;
+    }
+
+    // 13. V2: APPROVALS
+    match /approvals/{approvalId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      // create: a verified club member submits their OWN request as PENDING
+      allow create: if request.auth != null &&
+        isUserInClub(request.resource.data.clubId) &&
+        request.resource.data.requestedBy == request.auth.uid &&
+        request.resource.data.status == 'PENDING';
+      // update: decision only — status/decisions/resolvedAt may change, nothing
+      // else; decider must match the policy snapshot; no self-approval.
+      allow update: if request.auth != null &&
+        isUserInClub(resource.data.clubId) &&
+        resource.data.status == 'PENDING' &&
+        request.auth.uid != resource.data.requestedBy &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'decisions', 'resolvedAt']) &&
+        request.resource.data.status in ['APPROVED', 'REJECTED', 'CANCELLED'] &&
+        (
+          // SPECIFIC_USERS: approverRefs contains the user's uid
+          (resource.data.policySnapshot.approverType == 'SPECIFIC_USERS' &&
+           resource.data.policySnapshot.approverRefs.hasAny([request.auth.uid])) ||
+          // MEMBER_TYPE: user's derived memberType is in approverRefs
+          (resource.data.policySnapshot.approverType == 'MEMBER_TYPE' &&
+           resource.data.policySnapshot.approverRefs.hasAny([getMemberType(getUserData())])) ||
+          // PERMISSION: user has the required permission
+          (resource.data.policySnapshot.approverType == 'PERMISSION' &&
+           'permissions' in getUserData() &&
+           getUserData().permissions.hasAny(resource.data.policySnapshot.approverRefs)) ||
+          // ADMIN fallback
+          isAdmin(resource.data.clubId)
+        );
+      allow delete: if false;
+    }
+
+    // 14. V2: APPROVAL POLICIES (doc id = "{clubId}_{kind}")
+    match /approvalPolicies/{policyId} {
+      // read: any signed-in club member of the policy's club (docs carry clubId)
+      allow read: if request.auth != null && (
+        resource == null ||
+        !('clubId' in resource.data) ||
+        isUserInClub(resource.data.clubId)
+      );
+      // create/update by the club's admin; clubId immutable once set
+      allow create: if request.auth != null &&
+        isAdmin(request.resource.data.clubId);
+      allow update: if request.auth != null &&
+        isAdmin(resource.data.clubId) &&
+        request.resource.data.clubId == resource.data.clubId;
+      allow delete: if request.auth != null && isAdmin(resource.data.clubId);
+    }
+
+    // 14b. V2: TENANT ROLE TEMPLATE (doc id = clubId itself — one per club)
+    match /roleTemplates/{clubId} {
+      // read: any signed-in member of the club — every screen's permission
+      // resolution needs this to compute effective access.
+      allow read: if request.auth != null && (
+        resource == null || isUserInClub(resource.data.clubId)
+      );
+      // write: club admin only. This changes what an entire member type can
+      // see/do club-wide, so it stays a higher bar than per-user overrides
+      // (which EXCO can also manage via the 'access.manage' capability).
+      allow create: if request.auth != null &&
+        isAdmin(clubId) &&
+        request.resource.data.clubId == clubId;
+      allow update: if request.auth != null &&
+        isAdmin(clubId) &&
+        request.resource.data.clubId == clubId;
+      // delete: club admin only — used by "Reset to built-in defaults" to
+      // remove the customization entirely (not overwrite it with a copy).
+      allow delete: if request.auth != null && isAdmin(clubId);
+    }
+
+    // 15. V2: MEMBERSHIP ACTIONS
+    match /membershipActions/{actionId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId &&
+        isUserInClub(request.resource.data.clubId);
+      allow update: if request.auth != null &&
+        request.resource.data.clubId == resource.data.clubId &&
+        isAdmin(resource.data.clubId);
+      allow delete: if false;
+    }
+
+    // 16. SERVICE HOUR LOGS
+    // One doc per (event, member) using deterministic id = "{eventId}_{memberId}".
+    // ATTENDANCE-source entries are written client-side alongside attendanceMap.
+    // MANUAL-source entries require manage_members or admin.
+    // History is immutable once written — corrections use a new entry.
+    match /serviceHourLogs/{logId} {
+      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow create: if request.auth != null &&
+        request.resource.data.clubId == getUserData().clubId &&
+        isUserInClub(request.resource.data.clubId) &&
+        (
+          (request.resource.data.source == 'ATTENDANCE' &&
+            isUserInClub(request.resource.data.clubId)) ||
+          (request.resource.data.source == 'MANUAL' && (
+            isAdmin(request.resource.data.clubId) ||
+            ('permissions' in getUserData() &&
+              getUserData().permissions.hasAny(['manage_members']))
+          ))
+        );
+      allow update, delete: if false;
+    }
+  }
+}
