@@ -723,6 +723,86 @@ export const onApprovalResolved = onDocumentUpdated('approvals/{approvalId}', as
     }
   }
 
+  // ── Side-effect: RESIGNATION decided → atomic status writes ──
+  if (kind === 'RESIGNATION' && refCollection === 'members') {
+    const memberRef = admin.firestore().collection('members').doc(refId);
+    try {
+      const memberSnap = await memberRef.get();
+      if (!memberSnap.exists) {
+        console.error(`onApprovalResolved: member ${refId} not found`);
+      } else {
+        const memberData = memberSnap.data()!;
+        const uid: string = memberData.uid || refId;
+        const now = new Date().toISOString();
+        if (isApproved) {
+          const tenureEntry = {
+            from: memberData.joinedDate || now.slice(0, 10),
+            to: now.slice(0, 10),
+            exitReason: 'RESIGNED',
+            approvalId: event.params.approvalId,
+            reactivatedBy: null,
+          };
+          await Promise.all([
+            memberRef.update({
+              status: 'RESIGNED',
+              resignedAt: now,
+              resignationApprovalId: event.params.approvalId,
+              tenureHistory: FieldValue.arrayUnion(tenureEntry),
+              lastUpdatedAt: now,
+            }),
+            admin.firestore().collection('users').doc(uid).update({
+              status: 'RESIGNED',
+            }),
+          ]);
+          // Email member: resignation approved
+          const memberEmail: string = memberData.email || '';
+          const memberName: string = memberData.memberName || memberData.name || '';
+          if (memberEmail) {
+            const approvedBody = `
+              <p style="margin:0 0 16px;font-size:13px;color:#475569;line-height:1.6;">
+                Dear ${escapeHtml(memberName)},
+              </p>
+              <p style="margin:0 0 16px;font-size:13px;color:#475569;line-height:1.6;">
+                Your resignation from the club has been formally approved effective <strong>${now.slice(0, 10)}</strong>. We appreciate your contributions and wish you all the best.
+              </p>
+              <p style="margin:0 0 16px;font-size:13px;color:#475569;line-height:1.6;">
+                Your payment history and awards remain accessible in your alumni profile. You may also generate a service letter from the app at any time.
+              </p>
+            `;
+            await sendEmail(
+              memberEmail,
+              'Your Resignation Has Been Approved',
+              wrapEmailShell('#ea580c', '📋', 'Resignation Approved', approvedBody)
+            );
+          }
+        } else {
+          // Rejected — member stays ACTIVE, send notification email
+          const memberEmail: string = memberData.email || '';
+          const memberName: string = memberData.memberName || memberData.name || '';
+          const rejectionComment = (decisions?.[decisions.length - 1] as any)?.comment || '';
+          if (memberEmail) {
+            const rejBody = `
+              <p style="margin:0 0 16px;font-size:13px;color:#475569;line-height:1.6;">
+                Dear ${escapeHtml(memberName)},
+              </p>
+              <p style="margin:0 0 16px;font-size:13px;color:#475569;line-height:1.6;">
+                Your resignation request has been reviewed and was <strong>not approved</strong> at this time. Your membership remains fully active.
+              </p>
+              ${rejectionComment ? `<p style="margin:0 0 16px;font-size:13px;color:#475569;line-height:1.6;"><strong>Note from admin:</strong> ${escapeHtml(rejectionComment)}</p>` : ''}
+            `;
+            await sendEmail(
+              memberEmail,
+              'Resignation Request — Not Approved',
+              wrapEmailShell('#64748b', '📋', 'Resignation Not Approved', rejBody)
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`onApprovalResolved: Failed to process RESIGNATION for member ${refId}:`, err);
+    }
+  }
+
   const approvalId = event.params.approvalId as string;
 
   // ── Notify requester ──
@@ -927,6 +1007,93 @@ export const onApprovalCreated = onDocumentCreated('approvals/{approvalId}', asy
   );
 });
 
+// ─── Awards: send congratulation email on award creation ──────────────────────
+
+export const onAwardCreated = onDocumentCreated('awards/{awardId}', async (event) => {
+  const data = event.data?.data();
+  if (!data) return;
+
+  const { clubId, memberId, memberName, category, title, description, awardedByName, month } = data;
+
+  // Resolve member email from users collection
+  let memberEmail: string | null = null;
+  try {
+    const userSnap = await admin.firestore().collection('users').doc(memberId).get();
+    memberEmail = userSnap.data()?.email || null;
+  } catch {}
+
+  const baseUrl = await getClubBaseUrl(clubId);
+  const monthLabel = month
+    ? new Date(month + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+    : null;
+
+  const categoryLabel =
+    category === 'MEMBER_OF_MONTH_GENERAL' ? 'Member of the Month — General' :
+    category === 'MEMBER_OF_MONTH_BOARD'   ? 'Member of the Month — Board'   :
+    'Special Award';
+
+  const awardBadgeColor =
+    category === 'MEMBER_OF_MONTH_BOARD'   ? '#7c3aed' :
+    category === 'MEMBER_OF_MONTH_GENERAL' ? '#f59e0b' :
+    '#6366f1';
+
+  const html = wrapEmailShell(
+    awardBadgeColor,
+    '🏆',
+    `Congratulations ${escapeHtml(memberName)} — you've been recognised with a club award!`,
+    `
+    <h2 style="margin:0 0 4px;font-size:22px;font-weight:900;color:#1e293b;line-height:1.2;">
+      Congratulations, ${escapeHtml(memberName)}!
+    </h2>
+    <p style="margin:0 0 24px;color:#64748b;font-size:14px;line-height:1.6;">
+      Your dedication and contribution to the club has been recognised.
+    </p>
+
+    <!-- Award card -->
+    <div style="background:linear-gradient(135deg,${awardBadgeColor}12,${awardBadgeColor}08);border:1px solid ${awardBadgeColor}30;border-radius:12px;padding:24px;margin-bottom:24px;text-align:center;">
+      <p style="margin:0 0 6px;font-size:28px;">🏆</p>
+      <p style="margin:0 0 4px;font-size:18px;font-weight:900;color:#1e293b;">${escapeHtml(title)}</p>
+      <p style="margin:0 0 2px;font-size:12px;font-weight:700;color:${awardBadgeColor};text-transform:uppercase;letter-spacing:1px;">${escapeHtml(categoryLabel)}</p>
+      ${monthLabel ? `<p style="margin:6px 0 0;font-size:12px;color:#94a3b8;">${escapeHtml(monthLabel)}</p>` : ''}
+    </div>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;">
+      ${description ? row('Recognition note', escapeHtml(description), 'color:#475569;font-size:14px;font-style:italic;') : ''}
+      ${row('Awarded by', escapeHtml(awardedByName))}
+    </table>
+
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr><td align="center" style="padding:8px 0;">
+        <a href="${baseUrl}/?tab=members"
+           style="display:inline-block;background:${awardBadgeColor};color:#ffffff;text-decoration:none;font-weight:800;font-size:13px;padding:14px 32px;border-radius:8px;letter-spacing:0.5px;">
+          View My Profile &amp; Achievements
+        </a>
+      </td></tr>
+    </table>
+    `
+  );
+
+  const promises: Promise<any>[] = [];
+
+  if (memberEmail) {
+    promises.push(sendEmail(memberEmail, `🏆 Congratulations — ${title}`, html));
+  }
+
+  // In-app notification to the member
+  promises.push(
+    sendNotificationToUser(
+      memberId,
+      clubId,
+      `🏆 You've received an award!`,
+      `${awardedByName} recognised you with "${title}"`,
+      'AWARD',
+      '/?tab=members'
+    )
+  );
+
+  await Promise.allSettled(promises);
+});
+
 // ─── Password reset email template ────────────────────────────────────────────
 
 function passwordResetEmailHtml(resetLink: string, email: string): string {
@@ -972,3 +1139,4 @@ function passwordResetEmailHtml(resetLink: string, email: string): string {
 </body>
 </html>`;
 }
+

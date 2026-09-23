@@ -81,6 +81,25 @@ service cloud.firestore {
         );
     }
 
+    // HELPER: Check if user is an ACTIVE (non-resigned) verified club member.
+    // All operational reads/writes use this instead of isUserInClub so that
+    // resigned members lose access to club data automatically.
+    function isActiveMember(clubId) {
+      return isUserInClub(clubId) &&
+        (!('status' in getUserData()) || getUserData().status == 'ACTIVE');
+    }
+
+    // HELPER: Check if user has RESIGNED from the club.
+    // Used to grant narrow read access (own payments, own awards) post-resignation.
+    function isResignedMember(clubId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData().clubId == clubId &&
+        getUserData().verified == true &&
+        'status' in getUserData() &&
+        getUserData().status == 'RESIGNED';
+    }
+
     function isCurrentYear(clubId, rotaractYear) {
       return rotaractYear == null || 
              !exists(/databases/$(database)/documents/settings/$(clubId)) ||
@@ -97,19 +116,21 @@ service cloud.firestore {
     }
 
     // 1. CLUBS & TENANCY
+    // read: public — login page resolves club branding before auth
+    // write: Admin SDK only (Cloud Function onboarding); client writes are closed
     match /clubs/{slug} {
-      allow read: if true; 
-      allow write: if true; // SuperAdmin local/UAT onboarding
+      allow read: if true;
+      allow write: if false;
     }
 
     match /admin_locks/{clubId} {
-      allow read: if true; 
-      allow write: if true; // SuperAdmin local/UAT onboarding
+      allow read: if true;
+      allow write: if false;
     }
 
     // 2. EVENTS
     match /events/{eventId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow read: if request.auth != null && isActiveMember(resource.data.clubId);
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId && (
           isAdmin(request.resource.data.clubId) ||
@@ -159,10 +180,10 @@ service cloud.firestore {
 
     // 2a. EVENT ANNOUNCEMENTS (subcollection under events)
     match /events/{eventId}/announcements/{annId} {
-      // Any verified club member can read announcements for their club's events
+      // Active club members can read announcements for their club's events
       allow read: if request.auth != null &&
         exists(/databases/$(database)/documents/events/$(eventId)) &&
-        isUserInClub(get(/databases/$(database)/documents/events/$(eventId)).data.clubId);
+        isActiveMember(get(/databases/$(database)/documents/events/$(eventId)).data.clubId);
       // Only admins / board members can post or delete announcements
       allow create: if request.auth != null &&
         exists(/databases/$(database)/documents/events/$(eventId)) &&
@@ -182,7 +203,7 @@ service cloud.firestore {
 
     // 8. RESOURCES
     match /resources/{resourceId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow read: if request.auth != null && isActiveMember(resource.data.clubId);
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId && (
           isAdmin(request.resource.data.clubId) ||
@@ -205,7 +226,7 @@ service cloud.firestore {
 
     // 8b. RESOURCE DETAILS
     match /resourceDetails/{resourceId} {
-      allow read: if request.auth != null && (resource == null || isUserInClub(resource.data.clubId));
+      allow read: if request.auth != null && (resource == null || isActiveMember(resource.data.clubId));
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId && (
           isAdmin(request.resource.data.clubId) ||
@@ -253,10 +274,11 @@ service cloud.firestore {
 
     // 9. TASKS
     match /tasks/{taskId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
-      allow create: if request.auth != null && 
-        request.resource.data.clubId == getUserData().clubId;
-      allow update: if request.auth != null && 
+      allow read: if request.auth != null && isActiveMember(resource.data.clubId);
+      allow create: if request.auth != null &&
+        isActiveMember(request.resource.data.clubId);
+      allow update: if request.auth != null &&
+        isActiveMember(resource.data.clubId) &&
         request.resource.data.clubId == resource.data.clubId;
       allow delete: if request.auth != null && (
         isAdmin(resource.data.clubId) || 
@@ -280,12 +302,17 @@ service cloud.firestore {
         (resource != null && isUserInClub(resource.data.clubId))
       );
       
-      // create: self-create only with non-privileged payload, or the bootstrap admin path, or admin
-      allow create: if request.auth != null &&
-        request.auth.uid == userId && (
-          isSignupPayload() ||
-          isBootstrap(request.resource.data.clubId) ||
-          isAdmin(request.resource.data.clubId)
+      // create: self-create only with non-privileged payload, or the bootstrap admin path, or admin.
+      // SuperAdmin provisioning path: any authenticated caller may create a user doc for
+      // another UID while the target club is still in bootstrap state (no admin_lock yet).
+      // Once admin_locks/{clubId} exists, isBootstrap() returns false and this path closes.
+      allow create: if request.auth != null && (
+          (request.auth.uid == userId && (
+            isSignupPayload() ||
+            isBootstrap(request.resource.data.clubId) ||
+            isAdmin(request.resource.data.clubId)
+          )) ||
+          isBootstrap(request.resource.data.clubId)
         );
       
       // update: club admin, OR same-club manage_members holder editing OTHERS
@@ -312,7 +339,9 @@ service cloud.firestore {
     // 5. MEMBERS
     match /members/{docId} {
       // resource == null handles transaction reads on non-existent sentinel docs (e.g. members/system)
-      allow read: if request.auth != null && (resource == null || isUserInClub(resource.data.clubId));
+      // Resigned members can only read their own member doc (needed for AlumniView); they cannot list the collection.
+      allow read: if request.auth != null && (resource == null || isActiveMember(resource.data.clubId) ||
+        (isResignedMember(resource.data.clubId) && docId == request.auth.uid));
       allow create: if true; // Allow anonymous creation for SuperAdmin onboarding
       // Full update: club admin or manage_members permission holder (e.g. registry editors)
       // This also covers writing auditHistory, lastUpdatedBy, lastUpdatedAt, isBoardMember, isExcoMember
@@ -341,11 +370,12 @@ service cloud.firestore {
     // 6. PAYMENTS
     match /payments/{docId} {
       // Admins and managers can read all payments in their club.
-      // Regular members can only read their own payment records.
+      // Regular active members can only read their own payment records.
+      // Resigned members retain read access to their own payments as financial proof.
       allow read: if request.auth != null && (
         canManagePayments(resource.data.clubId) ||
         (
-          isUserInClub(resource.data.clubId) &&
+          isActiveMember(resource.data.clubId) &&
           (
             resource.data.memberId == request.auth.uid ||
             resource.data.submittedBy == request.auth.uid ||
@@ -354,13 +384,17 @@ service cloud.firestore {
               get(/databases/$(database)/documents/members/$(resource.data.memberId)).data.email == getUserData().email
             )
           )
+        ) ||
+        (
+          isResignedMember(resource.data.clubId) &&
+          (resource.data.memberId == request.auth.uid ||
+           resource.data.submittedBy == request.auth.uid)
         )
       );
-      // Any verified club member can submit a PENDING payment (Maker workflow).
-      // Admins/exco/manage_payments can create with any status.
+      // Only active (non-resigned) members can submit payments.
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId &&
-        isUserInClub(request.resource.data.clubId) &&
+        isActiveMember(request.resource.data.clubId) &&
         (request.resource.data.status == 'PENDING' || canManagePayments(request.resource.data.clubId));
       // Admins, exco members, or users with manage_payments can approve/reject
       allow update: if request.auth != null &&
@@ -384,7 +418,7 @@ service cloud.firestore {
 
     // 6a. CASH BATCHES
     match /cashBatches/{batchId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow read: if request.auth != null && isActiveMember(resource.data.clubId);
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId &&
         canManagePayments(request.resource.data.clubId) &&
@@ -411,14 +445,13 @@ service cloud.firestore {
 
     // 10. NOTIFICATIONS
     match /notifications/{notificationId} {
-      // Users can only read their own notifications AND must belong to and be verified in the same club/tenant
-      allow read: if request.auth != null && 
-                    resource.data.toUid == request.auth.uid && 
-                    isUserInClub(resource.data.clubId);
-      // Users can mark their own notifications as read
-      allow update: if request.auth != null && 
-                       resource.data.toUid == request.auth.uid && 
-                       isUserInClub(resource.data.clubId) &&
+      // Active members only — resigned members no longer receive club notifications
+      allow read: if request.auth != null &&
+                    resource.data.toUid == request.auth.uid &&
+                    isActiveMember(resource.data.clubId);
+      allow update: if request.auth != null &&
+                       resource.data.toUid == request.auth.uid &&
+                       isActiveMember(resource.data.clubId) &&
                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
       allow create, delete: if false;
     }
@@ -447,45 +480,46 @@ service cloud.firestore {
 
     // 13. V2: APPROVALS
     match /approvals/{approvalId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
-      // create: a verified club member submits their OWN request as PENDING
+      allow read: if request.auth != null && isActiveMember(resource.data.clubId);
+      // create: only active members submit requests (resigned members cannot)
       allow create: if request.auth != null &&
-        isUserInClub(request.resource.data.clubId) &&
+        isActiveMember(request.resource.data.clubId) &&
         request.resource.data.requestedBy == request.auth.uid &&
         request.resource.data.status == 'PENDING';
-      // update: decision only — status/decisions/resolvedAt may change, nothing
-      // else; decider must match the policy snapshot; no self-approval.
+      // update: requester may only cancel (withdraw) their own PENDING request;
+      //         deciders may APPROVE or REJECT (not cancel their own request).
       allow update: if request.auth != null &&
-        isUserInClub(resource.data.clubId) &&
         resource.data.status == 'PENDING' &&
-        request.auth.uid != resource.data.requestedBy &&
         request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly(['status', 'decisions', 'resolvedAt']) &&
-        request.resource.data.status in ['APPROVED', 'REJECTED', 'CANCELLED'] &&
         (
-          // SPECIFIC_USERS: approverRefs contains the user's uid
-          (resource.data.policySnapshot.approverType == 'SPECIFIC_USERS' &&
-           resource.data.policySnapshot.approverRefs.hasAny([request.auth.uid])) ||
-          // MEMBER_TYPE: user's derived memberType is in approverRefs
-          (resource.data.policySnapshot.approverType == 'MEMBER_TYPE' &&
-           resource.data.policySnapshot.approverRefs.hasAny([getMemberType(getUserData())])) ||
-          // PERMISSION: user has the required permission
-          (resource.data.policySnapshot.approverType == 'PERMISSION' &&
-           'permissions' in getUserData() &&
-           getUserData().permissions.hasAny(resource.data.policySnapshot.approverRefs)) ||
-          // ADMIN fallback
-          isAdmin(resource.data.clubId)
+          // Requester self-cancel (withdrawal)
+          (request.auth.uid == resource.data.requestedBy &&
+           request.resource.data.status == 'CANCELLED') ||
+          // Decider decision (APPROVED or REJECTED, non-self)
+          (isUserInClub(resource.data.clubId) &&
+           request.auth.uid != resource.data.requestedBy &&
+           request.resource.data.status in ['APPROVED', 'REJECTED'] &&
+           (
+             (resource.data.policySnapshot.approverType == 'SPECIFIC_USERS' &&
+              resource.data.policySnapshot.approverRefs.hasAny([request.auth.uid])) ||
+             (resource.data.policySnapshot.approverType == 'MEMBER_TYPE' &&
+              resource.data.policySnapshot.approverRefs.hasAny([getMemberType(getUserData())])) ||
+             (resource.data.policySnapshot.approverType == 'PERMISSION' &&
+              'permissions' in getUserData() &&
+              getUserData().permissions.hasAny(resource.data.policySnapshot.approverRefs)) ||
+             isAdmin(resource.data.clubId)
+           ))
         );
       allow delete: if false;
     }
 
     // 14. V2: APPROVAL POLICIES (doc id = "{clubId}_{kind}")
     match /approvalPolicies/{policyId} {
-      // read: any signed-in club member of the policy's club (docs carry clubId)
       allow read: if request.auth != null && (
         resource == null ||
         !('clubId' in resource.data) ||
-        isUserInClub(resource.data.clubId)
+        isActiveMember(resource.data.clubId)
       );
       // create/update by the club's admin; clubId immutable once set
       allow create: if request.auth != null &&
@@ -498,10 +532,8 @@ service cloud.firestore {
 
     // 14b. V2: TENANT ROLE TEMPLATE (doc id = clubId itself — one per club)
     match /roleTemplates/{clubId} {
-      // read: any signed-in member of the club — every screen's permission
-      // resolution needs this to compute effective access.
       allow read: if request.auth != null && (
-        resource == null || isUserInClub(resource.data.clubId)
+        resource == null || isActiveMember(resource.data.clubId)
       );
       // write: club admin only. This changes what an entire member type can
       // see/do club-wide, so it stays a higher bar than per-user overrides
@@ -519,10 +551,10 @@ service cloud.firestore {
 
     // 15. V2: MEMBERSHIP ACTIONS
     match /membershipActions/{actionId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow read: if request.auth != null && isActiveMember(resource.data.clubId);
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId &&
-        isUserInClub(request.resource.data.clubId);
+        isActiveMember(request.resource.data.clubId);
       allow update: if request.auth != null &&
         request.resource.data.clubId == resource.data.clubId &&
         isAdmin(resource.data.clubId);
@@ -534,11 +566,15 @@ service cloud.firestore {
     // ATTENDANCE-source entries are written client-side alongside attendanceMap.
     // MANUAL-source entries require manage_members or admin.
     // History is immutable once written — corrections use a new entry.
+    // Resigned members can read their own logs (needed for service letter generation).
     match /serviceHourLogs/{logId} {
-      allow read: if request.auth != null && isUserInClub(resource.data.clubId);
+      allow read: if request.auth != null && (
+        isActiveMember(resource.data.clubId) ||
+        (isResignedMember(resource.data.clubId) && resource.data.memberId == request.auth.uid)
+      );
       allow create: if request.auth != null &&
         request.resource.data.clubId == getUserData().clubId &&
-        isUserInClub(request.resource.data.clubId) &&
+        isActiveMember(request.resource.data.clubId) &&
         (
           (request.resource.data.source == 'ATTENDANCE' &&
             isUserInClub(request.resource.data.clubId)) ||
@@ -549,6 +585,39 @@ service cloud.firestore {
           ))
         );
       allow update, delete: if false;
+    }
+
+    // 17. AWARDS
+    // Admin creates awards; members can read their own; active members see all club awards.
+    // Resigned members retain read access to their own awards for service letter generation.
+    match /awards/{awardId} {
+      allow read: if request.auth != null && (
+        isActiveMember(resource.data.clubId) ||
+        (isResignedMember(resource.data.clubId) && resource.data.memberId == request.auth.uid)
+      );
+      allow create: if request.auth != null &&
+        isAdmin(request.resource.data.clubId) &&
+        request.resource.data.clubId == getUserData().clubId;
+      allow delete: if request.auth != null && isAdmin(resource.data.clubId);
+      allow update: if false;
+    }
+
+    // 18. RESIGNATIONS
+    // Uses the existing /approvals collection with kind: 'RESIGNATION'.
+    // This collection holds additional per-member resignation metadata
+    // (e.g. re-activation audit trail) separate from the approval workflow.
+    match /resignations/{resignationId} {
+      // Member can read their own; admins can read all in club
+      allow read: if request.auth != null && (
+        isActiveMember(resource.data.clubId) ||
+        (isResignedMember(resource.data.clubId) && resource.data.memberId == request.auth.uid)
+      );
+      allow create: if request.auth != null &&
+        isActiveMember(request.resource.data.clubId) &&
+        request.resource.data.memberId == request.auth.uid &&
+        request.resource.data.status == 'PENDING';
+      allow update: if request.auth != null && isAdmin(resource.data.clubId);
+      allow delete: if false;
     }
   }
 }
