@@ -6,18 +6,19 @@ on:
   push:
     branches:
       - main
-      - develop
 
 jobs:
   deploy_infra:
     runs-on: ubuntu-latest
 
     environment:
-      name: ${{ (github.event_name == 'repository_dispatch' && github.event.client_payload.environment) || (github.ref_name == 'main' && 'production' || 'uat') }}
+      name: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.environment || 'uat' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
