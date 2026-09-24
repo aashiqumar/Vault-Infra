@@ -1,23 +1,24 @@
 name: Deploy Vault Infra
 
 on:
+  repository_dispatch:
+    types: [ui-deployed]
   push:
     branches:
       - main
-      - develop
 
 jobs:
   deploy_infra:
     runs-on: ubuntu-latest
 
     environment:
-      name: ${{ github.ref_name == 'main' && 'production' || 'uat' }}
+      name: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.environment || 'uat' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.ref || github.ref }}
+          ref: main
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
