@@ -118,17 +118,20 @@ service cloud.firestore {
     // 1. CLUBS & TENANCY
     // read: public — login page resolves club branding before auth
     // create/delete: Admin SDK only (Cloud Function onboarding)
-    // update: club admin or any active member with the 'settings' permission
-    //         (mirrors who can access the Public Page tab in the Settings screen)
+    // update: verified ADMIN, or active member with 'settings' permission.
+    // Note: we do NOT use isAdmin(slug) here because the clubs doc ID may differ
+    // from user.clubId (auto-ID vs slug mismatch). The frontend only ever writes
+    // to the current club's doc (subdomain-resolved), so a role check is sufficient.
     match /clubs/{slug} {
       allow read: if true;
       allow create, delete: if false;
-      allow update: if request.auth != null && (
-        isAdmin(slug) ||
-        (isActiveMember(slug) &&
-         'permissions' in getUserData() &&
-         getUserData().permissions.hasAny(['settings']))
-      );
+      allow update: if request.auth != null &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData().verified == true &&
+        (
+          getUserData().role == 'ADMIN' ||
+          ('permissions' in getUserData() && getUserData().permissions.hasAny(['settings']))
+        );
     }
 
     match /admin_locks/{clubId} {
