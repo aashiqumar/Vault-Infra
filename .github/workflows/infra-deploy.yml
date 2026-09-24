@@ -3,9 +3,6 @@ name: Deploy Vault Infra
 on:
   repository_dispatch:
     types: [ui-deployed]
-  push:
-    branches:
-      - main
 
 jobs:
   deploy_infra:
